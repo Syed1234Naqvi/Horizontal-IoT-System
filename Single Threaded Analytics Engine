@@ -25,7 +25,7 @@ spark = SparkSession\
     .appName(application_name)\ 
     .getOrCreate() 
 
-client = pymongo.MongoClient("mongodb://admin:admin@cluster0-shard-00-00-xowtx.mongodb.net:27017,cluster0-shard-00-01-xowtx.mongodb.net:27017,cluster0-shard-00-02-xowtx.mongodb.net:27017/admin?replicaSet=Cluster0-shard-0&ssl=true") 
+client = pymongo.MongoClient("mongodb://admin:XYZ") 
 db = client.System 
 sensors = db.Sensors 
 thresholds = db.Thresholds 
