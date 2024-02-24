@@ -1,0 +1,175 @@
+import pymongo #connect to mongo atlas 
+from pymongo import MongoClient #connect to mongo atlas 
+#import socket 
+#import subprocess 
+#import os 
+#import datetime 
+import threading #threads 
+import logging #logging the threads 
+#so that log file can have utc 
+import datetime 
+
+#get the relevent collections 
+client = pymongo.MongoClient("mongodb://admin:admin@cluster0-shard-00-00-xowtx.mongodb.net:27017,cluster0-shard-00-01-xowtx.mongodb.net:27017,cluster0-shard-00-02-xowtx.mongodb.net:27017/admin?replicaSet=Cluster0-shard-0&ssl=true") 
+db = client.System 
+sensors = db.Sensors 
+thresholdColl = db.Thresholds 
+
+#checks if the node being examined has ever had its values collected 
+newNode = True 
+
+#a list of all nodes currently in the db 
+nodesIndB = list() 
+
+#keep track of 5 last values for each sensor 
+#sensorsValuesPerNode = dict() 
+
+#a list of all nodes already known by the analytics engine 
+nodeAlreadySeen = set() 
+
+#list of nodes already being activly tracked 
+nodeAlreadyTracked = list() 
+
+#array of arrays to hold latest node values 
+latestNodeValues = list() 
+
+#list of thresholds in database 
+latestThresholds = dict() 
+
+#configure logging tool 
+#[%(levelname)s] (%(threadName)-10s) 
+logging.basicConfig(level=logging.DEBUG, 
+format='(%(threadName)-10s) %(message)s', 
+) 
+file_handler = logging.FileHandler('results.log') 
+#[%(levelname)s] (%(threadName)-10s) 
+file_handler.setFormatter(logging.Formatter('(%(threadName)-10s) %(message)s')) 
+logging.getLogger().addHandler(file_handler) 
+
+#convert a string number to an actual number 
+def convertStringtoNum(s): 
+    if isinstance(s,int): 
+        #print s + " : mn num is int" 
+        return s 
+    if isinstance(s,float): 
+        #print s + " : mn num is float" 
+        return s 
+    try: 
+        float(s.decode("utf-8","ignore")) 
+        #print s + " : mn num converted to float" 
+        return float(s.decode("utf-8","ignore")) 
+    except: 
+        try: 
+            int(s.decode("utf-8","ignore")) 
+            #print s + " : mn num converted to int" 
+            return int(s.decode("utf-8","ignore")) 
+        except: 
+            #print s+" : mn num is unconvertable" 
+            return -1 
+
+#getLatestThresholdValues 
+def thresholdUpdater(): 
+    global latestThresholds 
+    #logging.debug('Starting') 
+    while 1: 
+        latestThresholds = thresholdColl.find_one({'docName':'threshold'}) 
+        #logging.debug('Exiting') 
+
+#update local list of nodes to match list from database (cannot delete obsolete nodes yet) 
+def nodeUpdater(): 
+    global nodesIndB 
+    #logging.debug('Starting') 
+    while 1: 
+        for node in sensors.find({"values":{'$exists':True}}): 
+            appId = node['appId'] 
+            if appId not in nodeAlreadySeen: 
+                nodeAlreadySeen.add(appId) 
+                nodesIndB.append(appId) 
+                #logging.debug(nodesIndB[-1]) 
+        #logging.debug('Exiting') 
+
+#given a node to update its that nodes sensor values 
+def updateNodeValues(name): 
+    sensorsValuesDict = dict() 
+    lastWarningTimeMessage = "" 
+    logging.debug('Starting analytics for ' + name) 
+    while 1: 
+        nodeSensors = sensors.find_one({"appId":name})['values'][-1] 
+        for sensor in nodeSensors: 
+            #logging.debug("analyzing " + str(sensor) + "for "+ name) 
+            if sensor not in latestThresholds: 
+                thresholdColl.update_one({"docName":"threshold"},{'$set':{sensor:[{"value":"UNSET","check":"UNSET","confirm":5}] }},upsert=False) 
+                continue 
+            elif latestThresholds[sensor][0]['value'] == "UNSET" or latestThresholds[sensor][0]['check'] == "UNSET" or latestThresholds[sensor][0]['confirm'] == "UNSET": 
+                #logging.debug(str(sensor) + "for "+ name +" is unconfigured") 
+                continue 
+            else: 
+                latestSensorValue = convertStringtoNum(nodeSensors[sensor]) 
+                latestSenosrValueTimeStamp = int(nodeSensors['Epoch']) 
+                #logging.debug(str(latestSensorValue) + " " + sensor + " " + nodeSensors[sensor] + str(lastWarningTimeStamp) + str(latestSenosrValueTimeStamp
+
+)) 
+                #if lastWarningTimeStamp != latestSenosrValueTimeStamp: 
+                #lastWarningTimeStamp = latestSenosrValueTimeStamp 
+                if (latestSensorValue != -1): 
+                    if "Accel" in sensor.decode("utf-8","ignore"): 
+                        print(sensor) 
+                        #logging.debug("checking threshold for " + str(sensor) + " belonging to "+ name + " value :" + str(latestSensorValue)) 
+                        #check if a tracking history exists for this nodes sensor 
+                        if str(sensor.decode("utf-8","ignore")) in sensorsValuesDict: 
+                            #logging.debug("adding to " + sensor + 's tracking history') 
+                            #add to the tracking history 
+                            sensorsValuesDict[str(sensor.decode("utf-8","ignore"))].append(latestSensorValue) 
+                            #keep the tracking history at 5 units 
+                            if len(sensorsValuesDict[str(sensor.decode("utf-8","ignore"))]) > 5: 
+                                #logging.debug("pruning " + sensor + 's tracking history') 
+                                del sensorsValuesDict[str(sensor.decode("utf-8","ignore"))][0] 
+                            else: #create a new tracking history for a new sensor 
+                                #logging.debug("creating " + sensor + 's tracking history') 
+                                sensorsValuesDict[str(sensor.decode("utf-8","ignore"))] = [latestSensorValue] 
+                                #logging.debug(sensorsValuesDict) 
+                                #logging.debug(latestThresholds[sensor][0]['check']) 
+                            if latestThresholds[sensor][0]['check'] == 'less': 
+                                if latestSensorValue < latestThresholds[sensor][0]['value']: 
+                                    if sum(i < latestThresholds[sensor][0]["value"] for i in sensorsValuesDict[str(sensor.decode("utf-8","ignore"))]) == latestThresholds[sensor][0]["confirm"]: 
+                                        #logging.info(str(sensor) + " " + str(latestSensorValue) + "is below the threshold of " + str(latestThresholds[sensor][0]['value'])) 
+                                        if (": " + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')) != lastWarningTimeMessage: 
+                                            logging.info(":" + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')) 
+                                            lastWarningTimeMessage = ": " + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c') 
+                                        #logging.debug(str( sum(i < latestThresholds[sensor][0]["value"] for i in sensorsValuesDict[str(sensor.decode("utf-8","ignore"))]))) 
+                                        #logging.debug(str( latestThresholds[sensor][0]["confirm"])) 
+                                    #else: 
+                                        #logging.info(": " + "has a safe heart rate" + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')) 
+                                elif latestThresholds[sensor][0]['check'] == 'absolute': 
+                                    #logging.info("absolute checker") 
+                                    if abs(latestSensorValue) - latestThresholds[sensor][0]["value"] > 1.5: 
+                                        #logging.info("absolute threshold passed") 
+                                        if sum((abs(i) - latestThresholds[sensor][0]["value"] > 1.5) for i in sensorsValuesDict[str(sensor.decode("utf-8","ignore"))]) == latestThresholds[sensor][0]["confirm"]: 
+                                            if (lastWarningTimeMessage != ": " + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')): 
+                                                logging.info(":" + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')) 
+                                                lastWarningTimeMessage = ": " + latestThresholds[sensor][0]["message"] + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c') 
+                                            #else: 
+                                                #logging.info(": " + "has a safe head" + ", UTC offset 0 :" + datetime.datetime.fromtimestamp(latestSenosrValueTimeStamp).strftime('%c')) 
+
+    logging.debug('ending analytics for ' + name) 
+
+#for every node in database, create start tracking its values in a seperate thread 
+def startTrackingValues(): 
+    global nodesIndB 
+    #logging.debug('Starting') 
+    while 1: 
+        for appId in nodesIndB: 
+            if appId not in nodeAlreadyTracked: 
+                nodeAlreadyTracked.append(appId) 
+                t = threading.Thread(name = appId,target=updateNodeValues, args=(appId,)) 
+                t.start() 
+                #logging.debug("started thread " + t.getName()) 
+    #logging.debug('Exiting') 
+
+t = threading.Thread(name='startTrackingValues', target=startTrackingValues) 
+w = threading.Thread(name='nodeUpdater', target=nodeUpdater) 
+z = threading.Thread(name='thresholdUpdater', target=thresholdUpdater) 
+
+w.start() 
+t.start() 
+z.start()
