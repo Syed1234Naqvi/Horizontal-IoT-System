@@ -1,0 +1,138 @@
+import pymongo 
+from pymongo import MongoClient 
+from pyspark.sql import SparkSession 
+import socket 
+import subprocess 
+import os 
+import datetime 
+
+filename = 'alertsRecords.txt' 
+if not os.path.exists(filename): 
+    print "creating records file" 
+    file(filename,'w').close() 
+
+databaseSensors = [] 
+postNewSensorsMessage = [] 
+newSensorDict ={} 
+sensorsAlreadySeen = set(databaseSensors) 
+sensorsValuesTracker = [] 
+sensorsValuesDict = dict() 
+# Spark application name 
+application_name = 'AlertDetector&Sender' 
+# Start the spark session and initial application 
+spark = SparkSession\ 
+    .builder\ 
+    .appName(application_name)\ 
+    .getOrCreate() 
+
+client = pymongo.MongoClient("mongodb://admin:admin@cluster0-shard-00-00-xowtx.mongodb.net:27017,cluster0-shard-00-01-xowtx.mongodb.net:27017,cluster0-shard-00-02-xowtx.mongodb.net:27017/admin?replicaSet=Cluster0-shard-0&ssl=true") 
+db = client.System 
+sensors = db.Sensors 
+thresholds = db.Thresholds 
+sensors_thresholds = thresholds.find() 
+listOfSensorsWithThresholds = list(sensors_thresholds[0].keys()) 
+
+def getNumUni(s): 
+    if isinstance(s,int): 
+        return s 
+    if isinstance(s,float): 
+        return s 
+    try: 
+        float(s.decode("utf-8","ignore")) 
+        return float(s.decode("utf-8","ignore")) 
+    except: 
+        try: 
+            int(s.decode("utf-8","ignore")) 
+            return int(s.decode("utf-8","ignore")) 
+        except: 
+            return -1 
+
+while (1): 
+    nodeName = "" 
+    timeStamp = 0 
+    for node in sensors.find({"values":{'$exists':True}}): 
+        if not node["values"]: 
+            break; 
+        latestNodeData = node["values"][-1] 
+        for key in node["values"][-1]: 
+            if key == "Node": 
+                nodeName = latestNodeData[key] 
+            if key == "Epoch": 
+                timeStamp = int(latestNodeData[key]) 
+            if(key != "Node" and key !="Epoch" and key !="Timestamp" and key !="Tag"): 
+                print ("key viewed: " + key.decode("utf-8","ignore")) 
+            if(key not in listOfSensorsWithThresholds): 
+                thresholds.update_one({"docName":"threshold"},{'$set':{key:[{"value":"UNSET","check":"UNSET","confirm":5}] }},upsert=False) 
+                listOfSensorsWithThresholds = list(sensors_thresholds[0].keys()) 
+
+    if sensors_thresholds[0][key][0]["check"] and sensors_thresholds[0][key][0]["value"]: 
+        if sensors_thresholds[0][key][0]["check"] != "UNSET" and sensors_thresholds[0][key][0]["value"]!="UNSET": 
+            if(getNumUni(node["values"][-1][key]) == -1): 
+                print "ERROR: invalid number from MN,skipping value " 
+                print node["values"][-1][key] 
+                print getNumUni(node["values"][-1][key]) 
+                break 
+        else: 
+            mnNumber = getNumUni(node["values"][-1][key]) 
+
+            if key.decode("utf8","ignore") in sensorsValuesDict: 
+                sensorsValuesDict[key.decode("utf-8","ignore")].append(mnNumber) 
+                if len(sensorsValuesDict[key.decode("utf-8","ignore")]) > 5: 
+                    del sensorsValuesDict[key.decode("utf-8","ignore")][0] 
+                else: 
+                    sensorsValuesDict[key.decode("utf-8","ignore")] = [mnNumber] 
+                    
+            if sensors_thresholds[0][key][0]["check"] == "greater": 
+                if mnNumber > sensors_thresholds[0][key][0]["value"]: 
+                    if sensorsValuesDict: 
+                        if key.decode("utf-8","ignore") in sensorsValuesDict: 
+                            if sum(i > sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")]) == sensors_thresholds[0][key][0]["confirm"]: 
+                                #print ("dangerous" +key.decode("utf-8","ignore")) 
+                                with open (filename,'a+') as f: 
+                                    f.write(key.decode("utf-8","ignore") + " : " + str(mnNumber) + '\n') 
+                                if os.stat(filename).st_size != 0: 
+                                    print subprocess.check_output(['tail','-1',filename])[0:-1] 
+                            else: 
+                                print key.decode("utf-8","ignore") + "safe, with a outlier value of : " + str(mnNumber) 
+                                print key.decode("utf-8","ignore") + "has " + str(sum(i > sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")]) ) + "/5 bad values" 
+                        else: 
+                            print "# of confirms : " + str(sensors_thresholds[0][key][0]["confirm"]) 
+                            print key.decode("utf-8","ignore") + "has a safe value : " + str(mnNumber)+ ",with a max allowable errors : " + str(sensors_thresholds[0][key][0]["confirm"])+ ", of which currently we have " + str(sum(i > sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")])) 
+            elif sensors_thresholds[0][key][0]["check"] == "lesser": 
+                if mnNumber < sensors_thresholds[0][key][0]["value"]: 
+                    if sensorsValuesDict: 
+                        if key.decode("utf8","ignore") in sensorsValuesDict: 
+                            if sum(i < sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf8","ignore")]) == sensors_thresholds[0][key][0]["confirm"]: 
+                                print ("dangerous " +key.decode("utf8","ignore") + ":" + str(mnNumber) + ", out of 5 : " + str(sum(i < sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")]))) 
+                                with open (filename,'a+') as f: 
+                                    f.write(sensors_thresholds[0][key][0]["message"] + " for " + nodeName + " at Zulu time zone (UTC) " + datetime.datetime.fromtimestamp(timeStamp).strftime('%c')) 
+                                if os.stat(filename).st_size != 0: 
+                                    print "updated file last line :" + subprocess.check_output(['tail','-1',filename])[0:-1] 
+                            else: 
+                                print key.decode
+
+("utf8","ignore") + "safe, with a outlier value of : " + str(mnNumber) 
+                                print key.decode("utf8","ignore") + "has " + str(sum(i < sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")]) ) + "/5 bad values" 
+                        else: 
+                            print "# of confirms : " + str(sensors_thresholds[0][key][0]["confirm"]) 
+                            print key.decode("utf-8","ignore") + "has a safe value of : " + str(mnNumber) + ",with a max allowable errors : " + str(sensors_thresholds[0][key][0]["confirm"])+ ", of which currently we have " + str(sum(i < sensors_thresholds[0][key][0]["value"] for i in sensorsValuesDict[key.decode("utf-8","ignore")])) 
+            elif sensors_thresholds[0][key][0]["check"] == "absolute": 
+                if abs(mnNumber) - abs(sensors_thresholds[0][key][0]["value"]) > 1.5: 
+                    if sensorsValuesDict: 
+                        if key.decode("utf-8","ignore") in sensorsValuesDict: 
+                            if sum(abs(abs(i) - sensors_thresholds[0][key][0]["value"]) > 1.5 for i in sensorsValuesDict[key.decode("utf-8","ignore")]) == sensors_thresholds[0][key][0]["confirm"]: 
+                                print "dangerous " +key.decode("utf8","ignore")+ ":" + str(mnNumber) + ", out of 5 : " + str(sum(abs(i) - abs(sensors_thresholds[0][key][0]["value"]) > 1.5 for i in sensorsValuesDict[key.decode("utf-8","ignore")]))) 
+                                with open (filename,'a+') as f: 
+                                    f.write(sensors_thresholds[0][key][0]["messaga"] + " for " + nodeName + " at Zulu time zone (UTC) " + datetime.datetime.fromtimestamp(timeStamp).strftime('%c')) 
+                                if os.stat(filename).st_size != 0: 
+                                    print "updated file last line :" + subprocess.check_output(['tail','-1',filename])[0:-1] 
+                            else: 
+                                print key.decode("utf8","ignore") + "safe, with a outlier value of : " + str(mnNumber) 
+                                print key.decode("utf8","ignore") + "has " + str(sum(abs(i) - abs(sensors_thresholds[0][key][0]["value"])> 1.5 for i in sensorsValuesDict[key.decode("utf-8","ignore")]) ) + "/5 bad values" 
+                        else: 
+                            print "# of confirms : " + str(sensors_thresholds[0][key][0]["confirm"]) 
+                            print key.decode("utf8","ignore") + "has a safe value of : " + str(mnNumber) + ",with a max allowable errors : " + str(sensors_thresholds[0][key][0]["confirm"])+ ", of which currently we have " + str(sum(abs(sensors_thresholds[0][key][0]["value"]) - abs(i) > 1.5 for i in sensorsValuesDict[key.decode("utf-8","ignore")]))) 
+
+alertFile.close() 
+client.close() 
+spark.stop()
